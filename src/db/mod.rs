@@ -7,7 +7,6 @@ use diesel::{
 
 use rocket::{
     http::Status,
-    outcome::IntoOutcome,
     request::{FromRequest, Outcome},
     Request,
 };
@@ -75,12 +74,10 @@ macro_rules! generate_connections {
         #[cfg($name)]
         impl CustomizeConnection<$ty, diesel::r2d2::Error> for DbConnOptions {
             fn on_acquire(&self, conn: &mut $ty) -> Result<(), diesel::r2d2::Error> {
-                (|| {
-                    if !self.init_stmts.is_empty() {
-                        conn.batch_execute(&self.init_stmts)?;
-                    }
-                    Ok(())
-                })().map_err(diesel::r2d2::Error::QueryError)
+                if !self.init_stmts.is_empty() {
+                    conn.batch_execute(&self.init_stmts).map_err(diesel::r2d2::Error::QueryError)?;
+                }
+                Ok(())
             }
         })+
 
@@ -97,7 +94,7 @@ macro_rules! generate_connections {
 
         impl Drop for DbConn {
             fn drop(&mut self) {
-                let conn = self.conn.clone();
+                let conn = Arc::clone(&self.conn);
                 let permit = self.permit.take();
 
                 // Since connection can't be on the stack in an async fn during an
@@ -143,21 +140,20 @@ macro_rules! generate_connections {
                                 }))
                                 .build(manager)
                                 .map_res("Failed to create pool")?;
-                            return Ok(DbPool {
+                            Ok(DbPool {
                                 pool: Some(DbPoolInner::$name(pool)),
                                 semaphore: Arc::new(Semaphore::new(CONFIG.database_max_conns() as usize)),
-                            });
+                            })
                         }
                         #[cfg(not($name))]
-                        #[allow(unreachable_code)]
-                        return unreachable!("Trying to use a DB backend when it's feature is disabled");
+                        unreachable!("Trying to use a DB backend when it's feature is disabled")
                     },
                 )+ }
             }
             // Get a connection from the pool
             pub async fn get(&self) -> Result<DbConn, Error> {
                 let duration = Duration::from_secs(CONFIG.database_timeout());
-                let permit = match timeout(duration, self.semaphore.clone().acquire_owned()).await {
+                let permit = match timeout(duration, Arc::clone(&self.semaphore).acquire_owned()).await {
                     Ok(p) => p.expect("Semaphore should be open"),
                     Err(_) => {
                         err!("Timeout waiting for database connection");
@@ -170,10 +166,10 @@ macro_rules! generate_connections {
                         let pool = p.clone();
                         let c = run_blocking(move || pool.get_timeout(duration)).await.map_res("Error retrieving connection from pool")?;
 
-                        return Ok(DbConn {
+                        Ok(DbConn {
                             conn: Arc::new(Mutex::new(Some(DbConnInner::$name(c)))),
                             permit: Some(permit)
-                        });
+                        })
                     },
                 )+ }
             }
@@ -304,19 +300,17 @@ pub trait FromDb {
 
 impl<T: FromDb> FromDb for Vec<T> {
     type Output = Vec<T::Output>;
-    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn from_db(self) -> Self::Output {
-        self.into_iter().map(crate::db::FromDb::from_db).collect()
+        self.into_iter().map(FromDb::from_db).collect()
     }
 }
 
 impl<T: FromDb> FromDb for Option<T> {
     type Output = Option<T::Output>;
-    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn from_db(self) -> Self::Output {
-        self.map(crate::db::FromDb::from_db)
+        self.map(FromDb::from_db)
     }
 }
 
@@ -372,19 +366,21 @@ pub mod models;
 
 /// Creates a back-up of the sqlite database
 /// MySQL/MariaDB and PostgreSQL are not supported.
-pub async fn backup_database(conn: &mut DbConn) -> Result<(), Error> {
+pub async fn backup_database(conn: &mut DbConn) -> Result<String, Error> {
     db_run! {@raw conn:
         postgresql, mysql {
             let _ = conn;
             err!("PostgreSQL and MySQL/MariaDB do not support this backup feature");
         }
         sqlite {
-            use std::path::Path;
             let db_url = CONFIG.database_url();
-            let db_path = Path::new(&db_url).parent().unwrap().to_string_lossy();
-            let file_date = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-            diesel::sql_query(format!("VACUUM INTO '{}/db_{}.sqlite3'", db_path, file_date)).execute(conn)?;
-            Ok(())
+            let db_path = std::path::Path::new(&db_url).parent().unwrap();
+            let backup_file = db_path
+                .join(format!("db_{}.sqlite3", chrono::Utc::now().format("%Y%m%d_%H%M%S")))
+                .to_string_lossy()
+                .into_owned();
+            diesel::sql_query(format!("VACUUM INTO '{backup_file}'")).execute(conn)?;
+            Ok(backup_file)
         }
     }
 }
@@ -393,13 +389,13 @@ pub async fn backup_database(conn: &mut DbConn) -> Result<(), Error> {
 pub async fn get_sql_server_version(conn: &mut DbConn) -> String {
     db_run! {@raw conn:
         postgresql, mysql {
-            sql_function!{
+            define_sql_function!{
                 fn version() -> diesel::sql_types::Text;
             }
             diesel::select(version()).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
         }
         sqlite {
-            sql_function!{
+            define_sql_function!{
                 fn sqlite_version() -> diesel::sql_types::Text;
             }
             diesel::select(sqlite_version()).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
@@ -416,8 +412,11 @@ impl<'r> FromRequest<'r> for DbConn {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         match request.rocket().state::<DbPool>() {
-            Some(p) => p.get().await.map_err(|_| ()).into_outcome(Status::ServiceUnavailable),
-            None => Outcome::Failure((Status::InternalServerError, ())),
+            Some(p) => match p.get().await {
+                Ok(dbconn) => Outcome::Success(dbconn),
+                _ => Outcome::Error((Status::ServiceUnavailable, ())),
+            },
+            None => Outcome::Error((Status::InternalServerError, ())),
         }
     }
 }
@@ -482,21 +481,9 @@ mod postgresql_migrations {
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/postgresql");
 
     pub fn run_migrations() -> Result<(), super::Error> {
-        use diesel::{Connection, RunQueryDsl};
+        use diesel::Connection;
         // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
         let mut connection = diesel::pg::PgConnection::establish(&crate::CONFIG.database_url())?;
-        // Disable Foreign Key Checks during migration
-
-        // FIXME: Per https://www.postgresql.org/docs/12/sql-set-constraints.html,
-        // "SET CONSTRAINTS sets the behavior of constraint checking within the
-        // current transaction", so this setting probably won't take effect for
-        // any of the migrations since it's being run outside of a transaction.
-        // Migrations that need to disable foreign key checks should run this
-        // from within the migration script itself.
-        diesel::sql_query("SET CONSTRAINTS ALL DEFERRED")
-            .execute(&mut connection)
-            .expect("Failed to disable Foreign Key Checks during migrations");
-
         connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }
